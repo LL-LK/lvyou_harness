@@ -68,8 +68,7 @@ class MilvusRAGAdapter(RAGPort):
 
     def __init__(self, config: Optional[MilvusRAGConfig] = None):
         self.config = config or MilvusRAGConfig()
-        self._client = None
-        self._collection = None
+        self._client: Optional["MilvusClient"] = None
         self._embedder: Optional[BGEEmbedder] = None
         self._initialized = False
         # BM25相关
@@ -96,11 +95,10 @@ class MilvusRAGAdapter(RAGPort):
                 logger.error("BGE模型初始化失败")
                 return False
 
-            # 2. 连接Milvus
+            # 2. 连接Milvus (使用MilvusClient API)
             logger.info(f"连接Milvus: {self.config.uri}")
-            from pymilvus import connections, Collection
-
-            connections.connect(uri=self.config.uri, timeout=30)
+            from pymilvus import MilvusClient
+            self._client = MilvusClient(uri=self.config.uri)
             logger.info("Milvus连接成功")
 
             # 3. 加载或创建collection
@@ -128,15 +126,15 @@ class MilvusRAGAdapter(RAGPort):
             return
 
         try:
-            if not self._collection or self._collection.num_entities == 0:
-                logger.info("Collection为空，跳过BM25初始化")
+            if not self._client or not self._client.has_collection(self.config.collection_name):
+                logger.info("Collection不存在，跳过BM25初始化")
                 return
 
             logger.info("初始化BM25索引...")
             # 从Milvus获取所有文本用于BM25
-            from pymilvus import Collection
-            results = self._collection.query(
-                expr="id >= 0",
+            results = self._client.query(
+                collection_name=self.config.collection_name,
+                filter="id >= 0",
                 output_fields=["id", "text"],
                 limit=10000,
             )
@@ -188,41 +186,40 @@ class MilvusRAGAdapter(RAGPort):
 
     def _load_or_create_collection(self):
         """加载或创建collection"""
-        from pymilvus import Collection, utility
-
-        if utility.has_collection(self.config.collection_name):
+        if self._client.has_collection(self.config.collection_name):
             logger.info(f"加载已有Collection: {self.config.collection_name}")
-            self._collection = Collection(self.config.collection_name)
-            self._collection.load()
+            self._client.load_collection(self.config.collection_name)
         else:
             logger.info(f"创建新Collection: {self.config.collection_name}")
             self._create_collection()
 
     def _create_collection(self):
         """创建collection"""
-        from pymilvus import Collection, FieldSchema, CollectionSchema, DataType, utility
-
-        fields = [
-            FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
-            FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=65535),
-            FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=self.config.embedding_dim),
-            FieldSchema(name="source", dtype=DataType.VARCHAR, max_length=128),
-            FieldSchema(name="data_type", dtype=DataType.VARCHAR, max_length=64),
-            FieldSchema(name="city", dtype=DataType.VARCHAR, max_length=64),
-            FieldSchema(name="title", dtype=DataType.VARCHAR, max_length=256),
-        ]
-        schema = CollectionSchema(fields=fields, description="桂林旅游数据")
-        self._collection = Collection(name=self.config.collection_name, schema=schema)
-
-        # 创建索引
-        index_params = {
-            "metric_type": self.config.metric_type,
-            "index_type": self.config.index_type,
-            "params": {"nlist": self.config.nlist},
-        }
-        self._collection.create_index(field_name="embedding", index_params=index_params)
-        self._collection.load()
-        logger.info("Collection创建并索引完成")
+        if not self._client.has_collection(self.config.collection_name):
+            dim = self.config.embedding_dim
+            schema = [
+                {"name": "text", "type": "varchar", "max_length": 65535},
+                {"name": "embedding", "type": "float_vector", "dim": dim},
+                {"name": "source", "type": "varchar", "max_length": 128},
+                {"name": "data_type", "type": "varchar", "max_length": 64},
+                {"name": "city", "type": "varchar", "max_length": 64},
+                {"name": "title", "type": "varchar", "max_length": 256},
+            ]
+            index_params = {
+                "vector": {
+                    "index_type": "IVF_FLAT",
+                    "metric_type": self.config.metric_type,
+                    "params": {"nlist": self.config.nlist},
+                }
+            }
+            self._client.create_collection(
+                collection_name=self.config.collection_name,
+                dimension=dim,
+                schema=schema,
+                index_params=index_params,
+                description="桂林旅游数据",
+            )
+        logger.info("Collection创建完成")
 
     def add_documents(
         self,
@@ -237,8 +234,7 @@ class MilvusRAGAdapter(RAGPort):
             return 0
 
         try:
-            from pymilvus import Collection
-
+            # 提取文本和元数据
             texts = []
             embeddings = []
             sources = []
@@ -246,7 +242,6 @@ class MilvusRAGAdapter(RAGPort):
             cities = []
             titles = []
 
-            # 提取文本
             for doc in documents:
                 texts.append(doc.get("content", "")[:5000])  # 限制长度
                 sources.append(doc.get("source", "unknown"))
@@ -259,24 +254,29 @@ class MilvusRAGAdapter(RAGPort):
             embeddings = self._embedder.embed(texts, normalize=True)
             logger.info("Embedding生成完成")
 
+            # 构建数据列表（用于MilvusClient）
+            data_list = []
+            for i in range(len(texts)):
+                data_list.append({
+                    "text": texts[i],
+                    "embedding": embeddings[i],
+                    "source": sources[i],
+                    "data_type": data_types[i],
+                    "city": cities[i],
+                    "title": titles[i],
+                })
+
             # 分批插入
             total_inserted = 0
-            for i in range(0, len(texts), batch_size):
-                batch_data = [
-                    texts[i:i+batch_size],
-                    embeddings[i:i+batch_size],
-                    sources[i:i+batch_size],
-                    data_types[i:i+batch_size],
-                    cities[i:i+batch_size],
-                    titles[i:i+batch_size],
-                ]
-                self._collection.insert(batch_data)
-                total_inserted += len(texts[i:i+batch_size])
+            for i in range(0, len(data_list), batch_size):
+                batch = data_list[i:i+batch_size]
+                self._client.insert(
+                    collection_name=self.config.collection_name,
+                    data=batch,
+                )
+                total_inserted += len(batch)
 
-            # 刷新
-            self._collection.flush()
             logger.info(f"成功插入{total_inserted}条文档")
-
             return total_inserted
 
         except Exception as e:
@@ -324,32 +324,32 @@ class MilvusRAGAdapter(RAGPort):
 
             # ========== 阶段2: 向量检索 ==========
             query_embedding = self._embedder.embed_single(query, normalize=True)
-            search_params = {
-                "metric_type": self.config.metric_type,
-                "params": {"nprobe": 10},
-            }
 
             # 扩大检索范围以合并BM25结果
             vector_limit = max(top_k * 4, self.config.bm25_top_k)
-            vector_results = self._collection.search(
+
+            results = self._client.search(
+                collection_name=self.config.collection_name,
                 data=[query_embedding],
-                anns_field="embedding",
-                param=search_params,
                 limit=vector_limit,
+                search_params={
+                    "metric_type": self.config.metric_type,
+                    "params": {"nprobe": 10},
+                },
                 output_fields=["id", "text", "source", "data_type", "city", "title"],
             )
 
             vector_docs = []
-            for hits in vector_results:
+            for hits in results:
                 for hit in hits:
                     vector_docs.append({
-                        "id": hit.id,
-                        "text": hit.entity.get("text", ""),
-                        "source": hit.entity.get("source", ""),
-                        "data_type": hit.entity.get("data_type", ""),
-                        "city": hit.entity.get("city", ""),
-                        "title": hit.entity.get("title", ""),
-                        "vector_score": hit.distance
+                        "id": hit.get("id"),
+                        "text": hit.get("entity", {}).get("text", ""),
+                        "source": hit.get("entity", {}).get("source", ""),
+                        "data_type": hit.get("entity", {}).get("data_type", ""),
+                        "city": hit.get("entity", {}).get("city", ""),
+                        "title": hit.get("entity", {}).get("title", ""),
+                        "vector_score": hit.get("distance", 0)
                     })
             logger.info(f"向量检索: {len(vector_docs)}条")
 
@@ -449,20 +449,23 @@ class MilvusRAGAdapter(RAGPort):
         """返回文档数量"""
         if not self._initialized:
             self.initialize()
-        if self._collection:
-            return self._collection.num_entities
+        if self._client:
+            try:
+                return self._client.get_collection_stats(
+                    self.config.collection_name
+                ).get("row_count", 0)
+            except Exception:
+                return 0
         return 0
 
     def delete_collection(self, name: str) -> bool:
         """删除collection"""
         try:
-            from pymilvus import Collection, utility
-            if utility.has_collection(name):
-                coll = Collection(name)
-                coll.drop()
+            if self._client.has_collection(name):
+                self._client.drop_collection(name)
                 logger.info(f"删除Collection: {name}")
             # 重置状态，强制重新初始化
-            self._collection = None
+            self._client = None
             self._initialized = False
             return True
         except Exception as e:
@@ -472,20 +475,22 @@ class MilvusRAGAdapter(RAGPort):
     def list_collections(self) -> List[str]:
         """列出所有collection"""
         try:
-            from pymilvus import utility
-            return utility.list_collections()
-        except:
-            return []
+            if self._client:
+                return self._client.list_collections()
+        except Exception:
+            pass
+        return []
 
     def close(self):
         """关闭连接"""
         try:
-            from pymilvus import connections
-            connections.disconnect("default")
+            if self._client:
+                self._client.close()
+                self._client = None
             if self._embedder:
                 self._embedder.close()
             self._initialized = False
-        except:
+        except Exception:
             pass
 
 
