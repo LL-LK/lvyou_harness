@@ -147,12 +147,40 @@ class MilvusRAGAdapter(RAGPort):
             self._bm25_texts = [r["text"][:2000] for r in results]  # 限制长度
             self._bm25_ids = [r["id"] for r in results]
 
-            # 使用jieba分词（如果可用）或简单空格分词
+            # 使用jieba分词（优先），失败则尝试pnlp或正则，最后fallback到空格分词
+            tokenized_corpus = None
+            # 尝试jieba
             try:
                 import jieba
                 tokenized_corpus = [list(jieba.cut(text)) for text in self._bm25_texts]
+                logger.info("使用jieba分词")
             except ImportError:
-                logger.warning("jieba未安装，使用空格分词")
+                logger.warning("jieba未安装，尝试pnlp分词...")
+                # 尝试pnlp
+                try:
+                    import pnlp
+                    import re
+                    def pnlp_tokenize(text):
+                        # pnlp的seg_word返回词列表
+                        result = pnlp.seg_word(text)
+                        return result if isinstance(result, list) else text.split()
+                    tokenized_corpus = [pnlp_tokenize(text) for text in self._bm25_texts]
+                    logger.info("使用pnlp分词")
+                except ImportError:
+                    logger.warning("pnlp未安装，尝试正则分词...")
+                    # 尝试正则分词（简单的中文分词正则）
+                    import re
+                    def regex_tokenize(text):
+                        # 按中文单字/双字词+英文单词+数字进行简单分词
+                        pattern = r'[\u4e00-\u9fff]+|[a-zA-Z]+|\d+(?:\.\d+)?'
+                        return [w for w in re.findall(pattern, text) if w]
+                    tokenized_corpus = [regex_tokenize(text) for text in self._bm25_texts]
+                    logger.info("使用正则分词")
+                except ImportError:
+                    logger.warning("正则分词不可用，使用空格分词")
+                    tokenized_corpus = [text.split() for text in self._bm25_texts]
+
+            if tokenized_corpus is None:
                 tokenized_corpus = [text.split() for text in self._bm25_texts]
 
             self._bm25 = BM25Plus(tokenized_corpus)
@@ -171,14 +199,35 @@ class MilvusRAGAdapter(RAGPort):
         try:
             import os
             model_path = self.config.rerank_model_path
-            if not os.path.exists(model_path):
-                logger.warning(f"重排模型不存在: {model_path}，跳过初始化")
+
+            # 尝试使用本地模型
+            if model_path and os.path.exists(model_path):
+                logger.info(f"初始化重排模型(本地): {model_path}")
+                self._reranker = CrossEncoder(model_path)
+                self._rerank_initialized = True
+                logger.info("重排模型初始化完成")
                 return
 
-            logger.info(f"初始化重排模型: {model_path}")
-            self._reranker = CrossEncoder(model_path)
-            self._rerank_initialized = True
-            logger.info("重排模型初始化完成")
+            # Fallback: 尝试使用HuggingFace上的模型(会自动下载)
+            fallback_models = [
+                "BAAI/bge-reranker-base",
+                "cross-encoder/ms-marco-MiniLM-L-6-v2",  # all-MiniLM-L6-v2的cross-encoder版本
+            ]
+
+            for model_name in fallback_models:
+                try:
+                    logger.info(f"尝试加载重排模型: {model_name} (如未下载将自动下载)")
+                    self._reranker = CrossEncoder(model_name)
+                    self._rerank_initialized = True
+                    logger.info(f"重排模型 {model_name} 初始化成功")
+                    return
+                except Exception as e:
+                    logger.warning(f"重排模型 {model_name} 加载失败: {e}")
+                    continue
+
+            # 所有模型都失败
+            logger.warning("所有重排模型加载失败，重排功能将不可用")
+            self._reranker = None
 
         except Exception as e:
             logger.warning(f"重排模型初始化失败: {e}")
@@ -301,11 +350,24 @@ class MilvusRAGAdapter(RAGPort):
             # ========== 阶段1: BM25初筛 ==========
             bm25_results = []
             if self._bm25 and BM25_AVAILABLE:
+                # 尝试jieba分词（优先），失败则尝试pnlp或正则
                 try:
                     import jieba
                     query_tokens = list(jieba.cut(query))
                 except ImportError:
-                    query_tokens = query.split()
+                    # 尝试pnlp
+                    try:
+                        import pnlp
+                        result = pnlp.seg_word(query)
+                        query_tokens = result if isinstance(result, list) else query.split()
+                    except ImportError:
+                        # 尝试正则
+                        try:
+                            import re
+                            pattern = r'[\u4e00-\u9fff]+|[a-zA-Z]+|\d+(?:\.\d+)?'
+                            query_tokens = [w for w in re.findall(pattern, query) if w]
+                        except ImportError:
+                            query_tokens = query.split()
 
                 bm25_scores = self._bm25.get_scores(query_tokens)
                 bm25_top_indices = sorted(
