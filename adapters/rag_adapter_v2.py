@@ -198,6 +198,7 @@ class MilvusRAGAdapter(RAGPort):
 
         try:
             import os
+            import socket
             model_path = self.config.rerank_model_path
 
             # 尝试使用本地模型
@@ -208,15 +209,30 @@ class MilvusRAGAdapter(RAGPort):
                 logger.info("重排模型初始化完成")
                 return
 
+            # 检查HuggingFace网络连通性（快速失败，避免长时间阻塞）
+            def _check_hf_connectivity(timeout=3):
+                try:
+                    sock = socket.create_connection(("huggingface.co", 443), timeout=timeout)
+                    sock.close()
+                    return True
+                except (socket.error, OSError):
+                    return False
+
+            if not _check_hf_connectivity(timeout=3):
+                logger.warning("HuggingFace网络不可达，跳过远程重排模型加载")
+                self._reranker = None
+                self._rerank_initialized = False
+                return
+
             # Fallback: 尝试使用HuggingFace上的模型(会自动下载)
             fallback_models = [
                 "BAAI/bge-reranker-base",
-                "cross-encoder/ms-marco-MiniLM-L-6-v2",  # all-MiniLM-L6-v2的cross-encoder版本
+                "cross-encoder/ms-marco-MiniLM-L-6-v2",
             ]
 
             for model_name in fallback_models:
                 try:
-                    logger.info(f"尝试加载重排模型: {model_name} (如未下载将自动下载)")
+                    logger.info(f"尝试加载重排模型: {model_name}")
                     self._reranker = CrossEncoder(model_name)
                     self._rerank_initialized = True
                     logger.info(f"重排模型 {model_name} 初始化成功")
